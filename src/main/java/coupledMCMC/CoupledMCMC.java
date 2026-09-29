@@ -3,7 +3,19 @@ package coupledMCMC;
 
 
 
-import beastfx.app.inputeditor.BeautiDoc;
+// Publicly exported by the declared beast-base 2.8.0-beta5 module.
+import beast.base.internal.json.JSONObject;
+import beast.base.internal.json.JSONArray;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.TreeMap;
+import java.util.HashSet;
+import java.util.Set;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Document;
 import beast.base.core.Citation.Citations;
 import beast.base.inference.Logger;
 import beast.base.inference.MCMC;
@@ -17,15 +29,15 @@ import beast.base.util.Randomizer;
 import beast.base.parser.XMLParser;
 import beast.base.parser.XMLProducer;
 
-import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.commons.statistics.distribution.BetaDistribution;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 @Citations(
 		{
@@ -53,8 +65,8 @@ public class CoupledMCMC extends MCMC {
 	public Input<String> tempDirInput = new Input<>("tempDir","directory where temporary files are written","");
 	
 	// input of the difference between temperature scalers
-	public Input<Double> deltaTemperatureInput = new Input<>("deltaTemperature","temperature difference between the i-th and the i-th+1 chain", 0.1);
-	public Input<Double> maxTemperatureInput = new Input<>("maxTemperature","maximal temperature of the hottest chain");	
+	public Input<Double> deltaTemperatureInput = new Input<>("deltaTemperature","nonnegative finite spacing parameter; adjacent temperature difference in geometric mode", 0.1);
+	public Input<Double> maxTemperatureInput = new Input<>("maxTemperature","optional finite nonnegative hottest-chain maximum, enforced from initialization even when optimise=false");
 	public Input<Boolean> logHeatedChainsInput = new Input<>("logHeatedChains","if true, log files for heated chains are also printed", false);
 	
 	public Input<Double> maxAdaptationInput = new Input<>("maxAdaptation","maximal step size for adapting the temperature", 0.001);	
@@ -68,7 +80,7 @@ public class CoupledMCMC extends MCMC {
 	public Input<Boolean> preScheduleInput = new Input<>("preSchedule","if true, how long chains are run for is scheduled at the beginning", true);
 	public Input<Boolean> neighbourSwappingInput = new Input<>("neighbourSwapping","if true, only chains that are next to each other are swapped", false);
 
-	public Input<Boolean> useBetaDistributionInput = new Input<>("useBetaDistribution","if true, the spacing between chains is assumed to be for the quantiles of a beta distribution with alpha=1 and beta=tuneable", false);
+	public Input<Boolean> useBetaDistributionInput = new Input<>("useBetaDistribution","if true, use Beta(1, deltaTemperature) spacing; zero spacing means no heating", false);
 
 	public Input<Boolean> heatLikelihoodOnlyInput = new Input<>("heatLikelihoodOnly", "if true, samples log(prior) + beta * log(likelihood) instead of the default beta * (log(prior) + log(likelihood))", false);
 
@@ -85,8 +97,6 @@ public class CoupledMCMC extends MCMC {
 	/** threads for running MCMC chains **/
 	Thread [] threads;
 	
-	/** beta distribution for spacing*/
-	BetaDistribution m_dist;
 	
 	/** keep track of time taken between logs to estimate speed **/
     long startLogTime;
@@ -115,24 +125,23 @@ public class CoupledMCMC extends MCMC {
 		}
 		if (nrOfChainsInput.get() == 1) {
 			Log.warning.println("Warning: coupled MCMC needs at least 2 chains, but the number of chains is 1. Running plain MCMC.");
+			super.initAndValidate();
+			return;
 		}
+		validateConfiguredTemperatureInputs();
 		// initialize the differently heated chains
 		chains = new HeatedChain[nrOfChainsInput.get()];
 		
-		resampleEvery = resampleEveryInput.get();				
+		resampleEvery = resampleEveryInput.get();
+        if (resampleEvery <= 0) throw new IllegalArgumentException("resampleEvery must be positive");
 		
-		deltaTemperature = deltaTemperatureInput.get();
+		spacing = useBetaDistributionInput.get() ? Spacing.Beta : Spacing.Geometric;
+		deltaTemperature = applySpacingBounds(deltaTemperatureInput.get());
 		
 		acceptedSwaps = new ArrayList<>();				
 		
 		optimise = optimiseInput.get();
 		
-		if (useBetaDistributionInput.get()) {
-			m_dist = BetaDistribution.of(1, deltaTemperature);
-			spacing = Spacing.Beta;
-		}else {
-			spacing = Spacing.Geometric;
-		}
 				
 	} // initAndValidate
 	
@@ -147,7 +156,7 @@ public class CoupledMCMC extends MCMC {
 			
 		}
 		
-		HeatedChain heated = new HeatedChain();
+		HeatedChain heated = heatLikelihoodOnlyInput.get() ? new HeatedChainLikelihoodOnly() : new HeatedChain();
 		if (initialisersInput.get().size()==0)
 			heated.initByName(
 					"distribution", posteriorInput.get(), 
@@ -238,10 +247,16 @@ public class CoupledMCMC extends MCMC {
 				// needed to avoid error of putting the working dir twice
 				String[] splittedFileName = stateFileName.split("/");
 				
-				chains[i].setStateFile(
-						splittedFileName[splittedFileName.length-1].replace(".state", "." + i + "state"), restoreFromFile);
-				chains[i].setChainNr(i);
-				chains[i].run();
+                String workingFile = splittedFileName[splittedFileName.length-1].replace(".state", "." + i + "state");
+                chains[i].setStateFile(restoreGeneration == null ? workingFile
+                        : restoreGeneration.rankFiles[i].toString(), restoreFromFile);
+                chains[i].setChainNr(i);
+                try {
+                    chains[i].run();
+                } finally {
+                    // Committed files are restore-only; automatic chain checkpoints remain mutable working files.
+                    chains[i].setStateFileName(workingFile);
+                }
 
 			} catch (Exception e) {
 				throw new RuntimeException(e);
@@ -253,41 +268,66 @@ public class CoupledMCMC extends MCMC {
 		
 
 		chainLength = chainLengthInput.get();
+
+        verifyRankLadder();
+        segmentControllerSample = 0;
+        // Future schedules are process-local and regenerated on resume.
 		
 		// pre schedule which chains to swap when
 		if (preScheduleInput.get()){
 			buildSchedule();
 		}
 		
-		if (restoreFromFile){
-			System.out.println("restoring from file, printing to screen but not to loggers will start again from 0");
-			System.out.println("we further assume that all chains ended in the same state, if logging heated chains" +
-			" the different heated chains can have different amount of iterations");
-		}		
+        if (restoreFromFile) {
+            System.out.println("MC3_RESTORE absolute=" + sampleOffset + " local=0 slot="
+                    + committedSlot + " sequence=" + committedSequence);
+        }
+
 		
 	}
 	
-	private double getTemperature(int i){
-		if (spacing==Spacing.Geometric) {
-			return i*deltaTemperature;
-		} else {
-			double beta=0;
-			if (deltaTemperature>0) {
-				try {
-					beta = 1-m_dist.cumulativeProbability(i/(double) chains.length);
-				} catch (Exception e) {
-					// TODO Auto-generated catch block
-					e.printStackTrace();
-				}
-			}
-			return 1/beta -1;
-		}
-		
-	}
-	
+    private void validateConfiguredTemperatureInputs() {
+        double configuredDelta = deltaTemperatureInput.get();
+        if (!Double.isFinite(configuredDelta) || configuredDelta < 0.0) {
+            throw new IllegalArgumentException("deltaTemperature must be finite and >= 0");
+        }
+        Double maximum = maxTemperatureInput.get();
+        if (maximum != null && (!Double.isFinite(maximum) || maximum < 0.0)) {
+            throw new IllegalArgumentException("maxTemperature must be finite and >= 0 when supplied");
+        }
+    }
+
+    /** Shared initialization/adaptation bounds; a negative internal proposal clamps to zero. */
+    private double applySpacingBounds(double proposedDelta) {
+        double bounded = Math.max(0.0, proposedDelta);
+        Double maximum = maxTemperatureInput.get();
+        // One rank is already cold: neither n-1 nor log(n) is a valid cap denominator.
+        if (maximum != null && chains.length > 1) {
+            double maximumDelta = spacing == Spacing.Beta
+                    ? Math.log1p(maximum) / Math.log(chains.length)
+                    : maximum / (chains.length - 1);
+            bounded = Math.min(bounded, maximumDelta);
+        }
+        return bounded;
+    }
+
+    private double getTemperature(int i) {
+        if (spacing == Spacing.Geometric) {
+            return i * deltaTemperature;
+        }
+        if (deltaTemperature == 0.0) {
+            return 0.0;
+        }
+        // Beta(1,d) survival is (1-i/n)^d. Avoid CDF subtraction and reciprocal cancellation.
+        double logBeta = deltaTemperature * Math.log1p(-i / (double) chains.length);
+        return Math.expm1(-logBeta);
+    }
+
+
 	class HeatedChainThread extends Thread {
 		final int chainNr;
 		long runUntil;
+        volatile Throwable failure;
 
 		HeatedChainThread(int chainNr, long runUntil) {
 			this.chainNr = chainNr;
@@ -297,53 +337,27 @@ public class CoupledMCMC extends MCMC {
 		public void run() {
 			try {
 				finishTimes[chainNr] = chains[chainNr].runTillResample(runUntil);
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
+            } catch (Throwable e) {
+                failure = e;
+            }
 		}
 	}
 	
 	@Override 
 	public void run() throws IOException {
-		initRun();
-		
-		if (restoreFromFile) {
+		if (nrOfChainsInput.get() == 1) {
 			try {
-				String str = BeautiDoc.load(new File(stateFileName));
-				String [] strs = str.split("\n");
-				for (int i = 0; i < strs.length; i++) {
-					String [] Spltstr = strs[i].replaceAll("\\s", "").split("=");
-					if (Spltstr[0].contentEquals("sample"))
-						sampleOffset = Long.parseLong(Spltstr[1]);
-					else if (Spltstr[0].contentEquals("totalSwaps"))
-						totalSwaps = Integer.parseInt(Spltstr[1]);
-					else if (Spltstr[0].contentEquals("successfullSwaps"))
-						successfullSwaps = Integer.parseInt(Spltstr[1]);
-					else if (Spltstr[0].contentEquals("successfullSwaps0"))
-						successfullSwaps0 = Integer.parseInt(Spltstr[1]);
-					else if (Spltstr[0].contentEquals("deltaTemperature"))
-						deltaTemperature = Double.parseDouble(Spltstr[1]);
-					else if (Spltstr[0].contentEquals("lastSwaps")) {
-						String[] tmp = Spltstr[1].replaceAll("\\[", "").replaceAll("\\]", "").replaceAll("\\s", "").split(",");
-						acceptedSwaps = new ArrayList<>();
-						for (int j = 0; j < tmp.length; j++)
-							acceptedSwaps.add(Boolean.parseBoolean(tmp[j]));
-					}					
-				}			
-				
-				Log.warning("Restoring: totalSwaps=" + totalSwaps + 
-						" successfullSwaps=" + successfullSwaps +
-						" successfullSwaps0=" + successfullSwaps0 +
-						" deltaTemperature=" + deltaTemperature);
-			} catch (IOException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
+				super.run();
+			} catch (org.xml.sax.SAXException | javax.xml.parsers.ParserConfigurationException e) {
+				throw new IOException("Could not run ordinary MCMC", e);
 			}
+			return;
 		}
+        preflightRestart();
+		initRun();
 
-		
-		if (neighbourSwappingInput.get()) {
-			runNeigbours();
+		if (neighbourSwappingInput.get() || (!preScheduleInput.get() && chains.length >= 2)) {
+			runRuntimeScheduled();
 			return;
 		}else {
 			runPrescheduled();
@@ -351,16 +365,14 @@ public class CoupledMCMC extends MCMC {
 		}
 	} // run
 	
-	private void runPrescheduled(){
+	private void runPrescheduled() throws IOException {
 		// run each thread until it's next swapping time
 		// start threads with individual chains here.
 		threads = new Thread[chains.length];
 		for (int k = 0; k < chains.length; k++) {
 			
-			long runk = chainLength;
-			
-			if (runTillIteration[k].size()>0)  runk = runTillIteration[k].get(0);
-			
+            long runk = nextPrescheduledStop(k, 0);
+
 			threads[k] = new HeatedChainThread(k, runk);
 			threads[k].start();
 		}
@@ -391,17 +403,13 @@ public class CoupledMCMC extends MCMC {
 				}
 			}
 			
-			try {
-				threads[i].join();
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-			}
-			
-			try {
-				threads[j].join();
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-			}
+            if (checkpointDue(sampleNr)) {
+                joinAllChains();
+                verifyCheckpointStop(sampleNr);
+            } else {
+                joinChain(i);
+                joinChain(j);
+            }
 			
 			// ensure that i is the colder chain		
 //			if (chains[i].getBeta() <  chains[j].getBeta()) {
@@ -426,10 +434,9 @@ public class CoupledMCMC extends MCMC {
 			double logAlpha = (p1after + p2after) - (p1before  + p2before);
 			if (Math.exp(logAlpha) > Randomizer.nextDouble()) {
 
-				successfullSwaps++;
-				if (i == 0) {
-					successfullSwaps0++;
-				}
+				TuningTransferPlan tuningPlan = prepareOperatorTuning(chains[i], chains[j]);
+
+                boolean involvesColdRank = chains[i].getChainNr() == 0 || chains[j].getChainNr() == 0;
 
 				// swap temperatures    
 				double beta = chains[i].getBeta();
@@ -445,7 +452,9 @@ public class CoupledMCMC extends MCMC {
 				swapLoggers(chains[i], chains[j]);				
 				
 				// swap Operator tuning
-				swapOperatorTuning(chains[i], chains[j]);		
+				tuningPlan.apply();
+                successfullSwaps++;
+                if (involvesColdRank) successfullSwaps0++;
 				
 				if (chains[j].getBeta() < chains[i].getBeta())
 					throw new IllegalArgumentException("error in temperatures of chains");
@@ -463,16 +472,8 @@ public class CoupledMCMC extends MCMC {
 			if (optimise && totalSwaps > optimiseDelayInput.get()) {
 				double delta = getDelta();			
 				
-				deltaTemperature += delta;
-	            
-	            // boundary case checks
-	    		if (maxTemperatureInput.get() != null){
-	    			deltaTemperature = Math.min(deltaTemperature, maxTemperatureInput.get()/(chains.length-1)); 
-	            } 
-	    		if (deltaTemperature < 0) {
-	            	deltaTemperature = 0;
-	            }
-	            
+				deltaTemperature = applySpacingBounds(deltaTemperature + delta);
+
 	            // figure out order of chains
 	            int n = chains.length;
 	            int [] order = new int[n];
@@ -485,9 +486,6 @@ public class CoupledMCMC extends MCMC {
 	            }
 	            HeapSort.sort(temp, order);
 	            
-	            // if the spacing is using a beta distribution, update the beta distribution
-	            if (spacing==Spacing.Beta)
-	            	m_dist = BetaDistribution.of(1, deltaTemperature);
 	            
 	            // set new temperatures asynchronously, in same order as before
 	            for (int k = 0; k < n; k++) {
@@ -499,16 +497,14 @@ public class CoupledMCMC extends MCMC {
 			runTillIteration[i].remove(0);
 			runTillIteration[j].remove(0);
 			
-			long runi = chainLength, runj = chainLength;
-			
-			if (runTillIteration[i].size()>0)  runi = runTillIteration[i].get(0);
-			if (runTillIteration[j].size()>0)  runj = runTillIteration[j].get(0);
-			
-			threads[i] = new HeatedChainThread(i, runi);
-			threads[i].start();
-			
-			threads[j] = new HeatedChainThread(j, runj);
-			threads[j].start();
+            segmentControllerSample = sampleNr;
+            if (checkpointDue(sampleNr)) {
+                storeStateToFile(sampleNr);
+                for (int k = 0; k < chains.length; k++) resumePrescheduled(k, sampleNr);
+            } else {
+                resumePrescheduled(i, sampleNr);
+                resumePrescheduled(j, sampleNr);
+            }
 			
 			System.out.print("\t" + (sampleNr + sampleOffset) + "\t" + successfullSwaps0 + "\t" + ((double) successfullSwaps/totalSwaps) + "\t" + deltaTemperature + " ");
 			if (startLogTime>0){			
@@ -529,22 +525,10 @@ public class CoupledMCMC extends MCMC {
 				startLogTime = System.currentTimeMillis();
 			}
 
-			if (sampleNr % storeEveryInput.get() == 0) {
-		        try {
-		        	storeStateToFile(sampleNr);
-		        } catch (Exception e) {
-		            e.printStackTrace();
-		        }
-			}			
+
 		}
 		// ensure that every chains ran to the end even if it's not participating in the last swap
-		for (int i = 0; i < threads.length; i++){
-			try {
-				threads[i].join();
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-			}
-		}
+        joinAllChains();
 		
 		System.err.println("#Swap attemps = " + totalSwaps);
 		System.err.println("#Successfull swaps = " + successfullSwaps);
@@ -557,12 +541,40 @@ public class CoupledMCMC extends MCMC {
 		}
 	}
 	
-	private void runNeigbours(){
+	// Select physical chains in current rank order; no persistent schedule is needed.
+	private int[] selectRuntimePair() {
+		int i, j;
+		if (neighbourSwappingInput.get()) {
+			int chain_i = Randomizer.nextInt(chains.length-1);
+			i = -1;
+			j = -1;
+			for (int k = 0; k < chains.length; k++) {
+				if (chains[k].getChainNr() == chain_i)
+					i = k;
+				if (chains[k].getChainNr() == chain_i+1)
+					j = k;
+			}
+		} else {
+			// Same distinct-index draw law as buildSchedule().
+			i = Randomizer.nextInt(chains.length);
+			j = i;
+			while (i == j)
+				j = Randomizer.nextInt(chains.length);
+			if (chains[i].getChainNr() > chains[j].getChainNr()) {
+				int tmp = i;
+				i = j;
+				j = tmp;
+			}
+		}
+		return new int[] {i, j};
+	}
+
+	private void runRuntimeScheduled() throws IOException {
 		// run each thread until it's next swapping time
 		// start threads with individual chains here.
 		threads = new Thread[chains.length];
 		for (int k = 0; k < chains.length; k++) {
-			threads[k] = new HeatedChainThread(k, resampleEvery);
+			threads[k] = new HeatedChainThread(k, Math.min(resampleEvery, chainLength));
 			threads[k].start();
 		}
 		
@@ -578,26 +590,11 @@ public class CoupledMCMC extends MCMC {
 
 		
 		for (long sampleNr = resampleEvery; sampleNr <= chainLength; sampleNr += resampleEvery) {	
-			// get the chains to swap, conditioning on them being neighbours
-			int chain_i = Randomizer.nextInt(chains.length-1);
-			int i=-1,j=-1;
-			
-			for (int k = 0; k<chains.length; k++) {
-				if (chains[k].getChainNr()==chain_i)
-					i=k;
-				if (chains[k].getChainNr()==chain_i+1)
-					j=k;	
-			}
-						
-			// look that every chain goes to the next place 
-			for (int k = 0; k < chains.length; k++) {
-				try {
-					threads[k].join();
-				} catch (InterruptedException e) {
-					e.printStackTrace();
-				}
-			}
-			
+			int[] pair = selectRuntimePair();
+			int i = pair[0], j = pair[1];
+
+            joinAllChains();
+
 			double p1before = chains[i].getCurrentLogLikelihood();
 			double p2before = chains[j].getCurrentLogLikelihood();
 
@@ -609,10 +606,9 @@ public class CoupledMCMC extends MCMC {
 			
 			double logAlpha = (p1after + p2after) - (p1before  + p2before);
 			if (Math.exp(logAlpha) > Randomizer.nextDouble()) {
-				successfullSwaps++;
-				if (i == 0) {
-					successfullSwaps0++;
-				}
+				TuningTransferPlan tuningPlan = prepareOperatorTuning(chains[i], chains[j]);
+
+                boolean involvesColdRank = chains[i].getChainNr() == 0 || chains[j].getChainNr() == 0;
 
 				// swap temperatures    
 				double beta = chains[i].getBeta();
@@ -628,7 +624,9 @@ public class CoupledMCMC extends MCMC {
 				swapLoggers(chains[i], chains[j]);				
 				
 				// swap Operator tuning
-				swapOperatorTuning(chains[i], chains[j]);		
+				tuningPlan.apply();
+                successfullSwaps++;
+                if (involvesColdRank) successfullSwaps0++;
 				
 				if (chains[j].getBeta() < chains[i].getBeta())
 					throw new IllegalArgumentException("error in temperatures of chains");
@@ -646,15 +644,8 @@ public class CoupledMCMC extends MCMC {
 			if (optimise && totalSwaps > optimiseDelayInput.get()) {
 				double delta = getDelta();			
 				
-				deltaTemperature += delta;
-	            
-	            // boundary case checks
-	    		if (maxTemperatureInput.get() != null){
-	    			deltaTemperature = Math.max(deltaTemperature, maxTemperatureInput.get()/(chains.length-1)); 
-	            } else if (deltaTemperature < 0) {
-	            	deltaTemperature = 0;
-	            }
-	            
+				deltaTemperature = applySpacingBounds(deltaTemperature + delta);
+
 	            // figure out order of chains
 	            int n = chains.length;
 	            int [] order = new int[n];
@@ -667,9 +658,6 @@ public class CoupledMCMC extends MCMC {
 	            }
 	            HeapSort.sort(temp, order);
 	            
-	            // if the spacing is using a beta distribution, update the beta distribution
-	            if (spacing==Spacing.Beta)
-	            	m_dist = BetaDistribution.of(1, deltaTemperature);
 	            
 	            // set new temperatures asynchronously, in same order as before
 	            for (int k = 0; k < n; k++) {
@@ -678,9 +666,12 @@ public class CoupledMCMC extends MCMC {
 	            
 			}
 
+            segmentControllerSample = sampleNr;
+            if (checkpointDue(sampleNr)) storeStateToFile(sampleNr);
+
 			if (sampleNr < chainLength) {
 				for (int k = 0; k < chains.length; k++) {
-					threads[k] = new HeatedChainThread(k, sampleNr+resampleEvery);
+					threads[k] = new HeatedChainThread(k, Math.min(sampleNr+resampleEvery, chainLength));
 					threads[k].start();
 				}
 			}
@@ -705,22 +696,10 @@ public class CoupledMCMC extends MCMC {
 				startLogTime = System.currentTimeMillis();
 			}
 
-			if (sampleNr % storeEveryInput.get() == 0) {
-		        try {
-		        	storeStateToFile(sampleNr);
-		        } catch (Exception e) {
-		            e.printStackTrace();
-		        }
-			}			
+
 		}
 		// ensure that every chains ran to the end even if it's not participating in the last swap
-		for (int i = 0; i < threads.length; i++){
-			try {
-				threads[i].join();
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-			}
-		}
+        joinAllChains();
 		
 		System.err.println("#Swap attemps = " + totalSwaps);
 		System.err.println("#Successfull swaps = " + successfullSwaps);
@@ -765,34 +744,135 @@ public class CoupledMCMC extends MCMC {
 		mcmc2.setStateFileName(stateFileName1);		
 	}
 
+	/** Transfer only the existing five-field payload of the resident active operators. */
 	void swapOperatorTuning(HeatedChain mcmc1, HeatedChain mcmc2) {
-		List<Operator> operatorList1 = new ArrayList<Operator>();
-		List<Operator> operatorList2 = new ArrayList<Operator>();		
-		
-		operatorList1 = mcmc1.getOperatorSchedule().operatorsInput.get();
-		operatorList2 = mcmc2.getOperatorSchedule().operatorsInput.get();
-		
-		
-		for (int i = 0; i < operatorList1.size(); i++){
-			Operator operator1 = operatorList1.get(i);
-			Operator operator2 = operatorList2.get(i);
-
-		    int m_nNrRejected = operator1.get_m_nNrRejected();
-		    int m_nNrAccepted = operator1.get_m_nNrAccepted();
-		    int m_nNrRejectedForCorrection = operator1.get_m_nNrRejectedForCorrection();
-		    int m_nNrAcceptedForCorrection = operator1.get_m_nNrAcceptedForCorrection();
-		    
-		    operator1.setAcceptedRejected(operator2.get_m_nNrRejected(), operator2.get_m_nNrAccepted(), operator2.get_m_nNrRejectedForCorrection(), operator2.get_m_nNrAcceptedForCorrection());
-		    operator2.setAcceptedRejected(m_nNrAccepted, m_nNrRejected, m_nNrAcceptedForCorrection, m_nNrRejectedForCorrection);
-		    
-		    
-		    double coercableParameterValue = operator1.getCoercableParameterValue();
-		    operator1.setCoercableParameterValue(operator2.getCoercableParameterValue());
-		    operator2.setCoercableParameterValue(coercableParameterValue);
-			
-		}		
+		prepareOperatorTuning(mcmc1, mcmc2).apply();
 	}
-	
+
+	private TuningTransferPlan prepareOperatorTuning(HeatedChain mcmc1, HeatedChain mcmc2) {
+		String context = "operator tuning exchange " + tuningChainLabel(mcmc1) + " <-> " + tuningChainLabel(mcmc2);
+		Map<String, Operator> first = activeTuningInventory(mcmc1, context + " side A");
+		Map<String, Operator> second = activeTuningInventory(mcmc2, context + " side B");
+		if (!first.keySet().equals(second.keySet())) {
+			throw new IllegalArgumentException(context + ": unequal operator ID sets " + first.keySet() + " / " + second.keySet());
+		}
+		IdentityHashMap<Operator, Boolean> firstObjects = new IdentityHashMap<>();
+		for (Operator operator : first.values()) firstObjects.put(operator, Boolean.TRUE);
+		for (Map.Entry<String, Operator> entry : second.entrySet()) {
+			Operator a = first.get(entry.getKey()), b = entry.getValue();
+			if (firstObjects.containsKey(b)) {
+				throw new IllegalArgumentException(context + ": cross-chain object alias for ID " + entry.getKey());
+			}
+			if (a.getClass() != b.getClass()) {
+				throw new IllegalArgumentException(context + ": class mismatch for ID " + entry.getKey()
+						+ ": " + tuningClassLabel(a) + " / " + tuningClassLabel(b));
+			}
+		}
+		// Complete correspondence and BOTH full payloads precede every accepted-exchange write.
+		List<TuningPair> pairs = new ArrayList<>();
+		for (Map.Entry<String, Operator> entry : first.entrySet()) {
+			String pairContext = context + " ID " + entry.getKey();
+			Operator a = entry.getValue(), b = second.get(entry.getKey());
+			try {
+				pairs.add(new TuningPair(a, b, new TuningPayload(a), new TuningPayload(b), pairContext));
+			} catch (RuntimeException e) {
+				throw new IllegalStateException(pairContext + ": payload read failed before exchange mutation", e);
+			}
+		}
+		return new TuningTransferPlan(pairs);
+	}
+
+	private String tuningChainLabel(HeatedChain chain) {
+		int physical = -1;
+		if (chains != null) {
+			for (int i = 0; i < chains.length; i++) if (chains[i] == chain) physical = i;
+		}
+		return "physical=" + physical + ",rank=" + chain.getChainNr();
+	}
+
+	private static String tuningClassLabel(Operator operator) {
+		Class<?> type = operator.getClass();
+		return type.getName() + " [loader=" + type.getClassLoader()
+				+ ", origin=" + type.getProtectionDomain().getCodeSource() + "]";
+	}
+
+	private static Map<String, Operator> activeTuningInventory(HeatedChain chain, String context) {
+		if (chain.getOperatorSchedule() == null || chain.getOperatorSchedule().operators == null) {
+			throw new IllegalArgumentException(context + ": unavailable active operator inventory");
+		}
+		List<Operator> snapshot = new ArrayList<>(chain.getOperatorSchedule().operators);
+		if (snapshot.isEmpty()) throw new IllegalArgumentException(context + ": empty active operator inventory");
+		IdentityHashMap<Operator, Boolean> seen = new IdentityHashMap<>();
+		Map<String, Operator> byID = new LinkedHashMap<>();
+		for (int position = 0; position < snapshot.size(); position++) {
+			Operator operator = snapshot.get(position);
+			if (operator == null) throw new IllegalArgumentException(context + ": null operator at position " + position);
+			if (seen.put(operator, Boolean.TRUE) != null) continue;
+			String id = operator.getID();
+			if (id == null || id.isBlank() || id.equals("unknown")) {
+				throw new IllegalArgumentException(context + ": unusable ID " + id + " at position " + position + " class " + tuningClassLabel(operator));
+			}
+			if (byID.put(id, operator) != null) {
+				throw new IllegalArgumentException(context + ": duplicate ID " + id + " on distinct objects at position " + position);
+			}
+		}
+		return byID;
+	}
+
+	private static final class TuningPayload {
+		private final int accepted, rejected, acceptedForCorrection, rejectedForCorrection;
+		private final double scalar;
+
+		private TuningPayload(Operator operator) {
+			accepted = operator.get_m_nNrAccepted();
+			rejected = operator.get_m_nNrRejected();
+			acceptedForCorrection = operator.get_m_nNrAcceptedForCorrection();
+			rejectedForCorrection = operator.get_m_nNrRejectedForCorrection();
+			scalar = operator.getCoercableParameterValue();
+		}
+
+		private void applyTo(Operator operator) {
+			operator.setAcceptedRejected(accepted, rejected, acceptedForCorrection, rejectedForCorrection);
+			operator.setCoercableParameterValue(scalar);
+		}
+	}
+
+	private static final class TuningPair {
+		private final Operator first, second;
+		private final TuningPayload firstPayload, secondPayload;
+		private final String context;
+
+		private TuningPair(Operator first, Operator second, TuningPayload firstPayload, TuningPayload secondPayload, String context) {
+			this.first = first;
+			this.second = second;
+			this.firstPayload = firstPayload;
+			this.secondPayload = secondPayload;
+			this.context = context;
+		}
+
+		private void apply() {
+			try {
+				secondPayload.applyTo(first);
+				firstPayload.applyTo(second);
+			} catch (RuntimeException e) {
+				// Arbitrary custom setter failures are fatal; no generic rollback is promised.
+				throw new IllegalStateException(context + ": tuning commit failed; exchange cannot continue", e);
+			}
+		}
+	}
+
+	private static final class TuningTransferPlan {
+		private final TuningPair[] pairs;
+
+		private TuningTransferPlan(List<TuningPair> pairs) {
+			this.pairs = pairs.toArray(new TuningPair[0]);
+		}
+
+		private void apply() {
+			for (TuningPair pair : pairs) pair.apply();
+		}
+	}
+
 	/* makes the schedule of when to swap which chains */
 	@SuppressWarnings("unchecked")
 	void buildSchedule(){
@@ -821,34 +901,357 @@ public class CoupledMCMC extends MCMC {
 		}
 	}
 	
-	void storeStateToFile(long currentSample) throws FileNotFoundException {
-        PrintStream out;
-		try {
-			out = new PrintStream(stateFileName + ".new");
-			out.print("sample=" + (currentSample + sampleOffset) + "\n");
-	        out.print("totalSwaps=" + totalSwaps + "\n");
-	        out.print("successfullSwaps=" + successfullSwaps + "\n");
-	        out.print("successfullSwaps0=" + successfullSwaps0 + "\n");
-	        out.print("deltaTemperature=" + deltaTemperature + "\n");
-        	out.print("lastSwaps=" + acceptedSwaps.toString() + "\n");
-	
-	        for (int k = 0; k < chains.length; k++) {
-	        	out.print("beta_chain." + k + "=" + chains[k].getBeta() + "\n");
-	        }
-	        //out.print(new XMLProducer().toXML(this));
-	        out.close();
-	        File newStateFile = new File(stateFileName + ".new");
-	        File oldStateFile = new File(stateFileName);
-	        oldStateFile.delete();
-	        // newStateFile.renameTo(oldStateFile); -- unstable under windows
-	        Files.move(newStateFile.toPath(), oldStateFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-		} catch (IOException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
+    private static final String CHECKPOINT_EPOCH = "POST_EXCHANGE_POST_ADAPTATION";
+    private long committedSequence = 0;
+    private String committedSlot;
+    private long segmentControllerSample = 0;
+    private Generation restoreGeneration;
 
-	}
-	
+    private static final class Generation {
+        final String slot;
+        final long sequence;
+        final Map<String, String> fields;
+        Path[] rankFiles;
+        Generation(String slot, long sequence, Map<String, String> fields) {
+            this.slot = slot;
+            this.sequence = sequence;
+            this.fields = fields;
+        }
+    }
+
+    private Path descriptorPath(String slot) {
+        return Path.of(stateFileName + ".mc3." + slot + ".commit").toAbsolutePath();
+    }
+
+    private void joinChain(int physical) {
+        try {
+            if (threads[physical] != null) threads[physical].join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while joining chain " + physical, e);
+        }
+        if (threads[physical] instanceof HeatedChainThread) {
+            Throwable failure = ((HeatedChainThread) threads[physical]).failure;
+            if (failure != null) throw new IllegalStateException("Heated chain failed: " + physical, failure);
+        }
+    }
+
+    private void joinAllChains() {
+        for (int k = 0; k < chains.length; k++) joinChain(k);
+    }
+
+    // Preserve the existing controller cadence: only exchange boundaries divisible by storeEvery.
+    // Nonpositive storeEvery disables periodic controller commits; ordinary working files are separate.
+    private boolean checkpointDue(long sample) {
+        return storeEveryInput.get() > 0 && sample > 0 && sample % storeEveryInput.get() == 0;
+    }
+
+    private long nextCheckpointAfter(long sample) {
+        long cadence = storeEveryInput.get();
+        if (cadence <= 0) return Long.MAX_VALUE;
+        long a = cadence, b = resampleEvery;
+        while (b != 0) { long remainder = a % b; a = b; b = remainder; }
+        long interval = Math.multiplyExact(cadence / a, (long) resampleEvery);
+        long intervals = sample / interval;
+        if (intervals == Long.MAX_VALUE || interval > Long.MAX_VALUE / (intervals + 1)) return Long.MAX_VALUE;
+        return (intervals + 1) * interval;
+    }
+
+    private long nextPrescheduledStop(int physical, long after) {
+        long participation = runTillIteration[physical].isEmpty() ? chainLength : runTillIteration[physical].get(0);
+        return Math.min(chainLength, Math.min(participation, nextCheckpointAfter(after)));
+    }
+
+    private void resumePrescheduled(int physical, long after) {
+        if (after >= chainLength) return;
+        threads[physical] = new HeatedChainThread(physical, nextPrescheduledStop(physical, after));
+        threads[physical].start();
+    }
+
+    private int[] verifyRankLadder() {
+        int[] physicalForRank = new int[chains.length];
+        java.util.Arrays.fill(physicalForRank, -1);
+        for (int physical = 0; physical < chains.length; physical++) {
+            HeatedChain chain = chains[physical];
+            int rank = chain.getChainNr();
+            if (rank < 0 || rank >= chains.length || physicalForRank[rank] != -1)
+                throw new IllegalStateException("Checkpoint rank set is not a permutation");
+            physicalForRank[rank] = physical;
+            double expected = 1.0 / (1.0 + getTemperature(rank));
+            if (!betaAgrees(chain.getBeta(), expected) || (rank == 0 && chain.getBeta() != 1.0))
+                throw new IllegalStateException("Checkpoint ladder mismatch at rank " + rank);
+        }
+        return physicalForRank;
+    }
+
+    private static boolean betaAgrees(double actual, double expected) {
+        return Double.isFinite(actual) && actual >= 0 && actual <= 1
+                && Math.abs(actual - expected) <= 1e-12 * Math.max(1.0, Math.abs(expected));
+    }
+
+    private void verifyCheckpointStop(long sample) {
+        for (int k = 0; k < chains.length; k++) {
+            if (threads != null && threads[k] != null && threads[k].isAlive())
+                throw new IllegalStateException("Chain running during checkpoint: " + k);
+            if (chains[k].getCurrentSample() != Math.addExact(sample, 1))
+                throw new IllegalStateException("Chain did not stop at checkpoint " + sample + ": " + k
+                        + " next local sample=" + chains[k].getCurrentSample());
+        }
+    }
+
+    private Map<String, String> restartConfiguration() {
+        Map<String, String> signature = new TreeMap<>();
+        signature.put("config.chains", nrOfChainsInput.get().toString());
+        signature.put("config.resampleEvery", resampleEveryInput.get().toString());
+        signature.put("config.spacing", spacing.name());
+        signature.put("config.optimise", optimiseInput.get().toString());
+        signature.put("config.optimiseDelay", optimiseDelayInput.get().toString());
+        signature.put("config.target", Double.toHexString(targetAcceptanceProbabilityInput.get()));
+        signature.put("config.maxAdaptation", Double.toHexString(maxAdaptationInput.get()));
+        signature.put("config.maxTemperature", maxTemperatureInput.get() == null ? "null"
+                : Double.toHexString(maxTemperatureInput.get()));
+        signature.put("config.preSchedule", preScheduleInput.get().toString());
+        signature.put("config.neighbourSwapping", neighbourSwappingInput.get().toString());
+        signature.put("config.heatLikelihoodOnly", heatLikelihoodOnlyInput.get().toString());
+        return signature;
+    }
+
+    private static String sha256(Path path) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (java.io.InputStream in = Files.newInputStream(path)) {
+                byte[] buffer = new byte[8192];
+                int count;
+                while ((count = in.read(buffer)) >= 0) digest.update(buffer, 0, count);
+            }
+            return java.util.HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("SHA-256 unavailable", e);
+        }
+    }
+
+    /** Validate the actual final bytes, not a successful return from BEAST's writer. */
+    private static void validateRankFile(Path file, long absoluteSample) throws IOException {
+        if (!Files.isRegularFile(file) || Files.isSymbolicLink(file) || Files.size(file) == 0)
+            throw new IOException("Missing/empty/indirect committed rank file: " + file);
+        try {
+            String text = Files.readString(file, StandardCharsets.UTF_8);
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            Document doc = factory.newDocumentBuilder().parse(file.toFile());
+            if (!"itsabeastystatewerein".equals(doc.getDocumentElement().getTagName())
+                    || !"2.0".equals(doc.getDocumentElement().getAttribute("version"))
+                    || Long.parseLong(doc.getDocumentElement().getAttribute("sample")) != absoluteSample)
+                throw new IOException("Committed rank XML/sample mismatch: " + file);
+            String close = "</itsabeastystatewerein>";
+            int at = text.indexOf(close);
+            if (at < 0) throw new IOException("Missing BEAST state XML: " + file);
+            String appendix = text.substring(at + close.length()).trim();
+            if (!appendix.startsWith("<!--") || !appendix.endsWith("-->"))
+                throw new IOException("Missing operator appendix: " + file);
+            JSONObject operators = new JSONObject(appendix.substring(4, appendix.length() - 3).trim());
+            JSONArray list = operators.getJSONArray("operators");
+            for (int k = 0; k < list.length(); k++) list.getJSONObject(k);
+        } catch (Exception e) {
+            if (e instanceof IOException) throw (IOException) e;
+            throw new IOException("Invalid composite rank checkpoint: " + file, e);
+        }
+    }
+
+    private static Map<String, String> readDescriptor(Path file) throws IOException {
+        if (Files.isSymbolicLink(file)) throw new IOException("Indirect checkpoint descriptor: " + file);
+        Map<String, String> fields = new TreeMap<>();
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            int equals = line.indexOf('=');
+            if (equals < 1 || fields.putIfAbsent(line.substring(0, equals), line.substring(equals + 1)) != null)
+                throw new IOException("Malformed/duplicate checkpoint descriptor entry: " + file);
+        }
+        return fields;
+    }
+
+    private static String require(Map<String, String> fields, String name) throws IOException {
+        String value = fields.get(name);
+        if (value == null) throw new IOException("Missing checkpoint field " + name);
+        return value;
+    }
+
+    private static long number(Map<String, String> fields, String name) throws IOException {
+        try {
+            long value = Long.parseLong(require(fields, name));
+            if (value < 0) throw new NumberFormatException("negative");
+            return value;
+        } catch (NumberFormatException e) { throw new IOException("Invalid checkpoint integer " + name, e); }
+    }
+
+    private static List<Boolean> history(String text) throws IOException {
+        List<Boolean> values = new ArrayList<>();
+        if (!text.isEmpty()) for (String token : text.split(",", -1)) {
+            if (!token.equals("true") && !token.equals("false")) throw new IOException("Invalid acceptedSwaps history");
+            values.add(Boolean.valueOf(token));
+        }
+        return values;
+    }
+
+    private Generation readEnvelope(String slot) throws IOException {
+        Path path = descriptorPath(slot);
+        if (!Files.exists(path)) return null;
+        Map<String, String> fields = readDescriptor(path);
+        if (!require(fields, "format").equals("CoupledMCMC-checkpoint-v1")
+                || !require(fields, "slot").equals(slot)) throw new IOException("Invalid checkpoint format/slot: " + path);
+        long sequence = number(fields, "sequence");
+        if (sequence == 0) throw new IOException("Checkpoint sequence must be positive");
+        return new Generation(slot, sequence, fields);
+    }
+
+    private Generation discoverGeneration() throws IOException {
+        // An unreadable envelope cannot safely be ordered; fail rather than guess/fall back.
+        Generation a = readEnvelope("A"), b = readEnvelope("B");
+        if (a == null && b == null) throw new IOException("Legacy/unqualified multi-chain restart: no v1 committed descriptor");
+        if (a != null && b != null && a.sequence == b.sequence)
+            throw new IOException("Conflicting/equal committed generation sequences");
+        Generation newest = a == null ? b : b == null || a.sequence > b.sequence ? a : b;
+        validateGeneration(newest); // Any corrupt newest publication is a hard failure, never a fallback.
+        return newest;
+    }
+
+    private void validateGeneration(Generation generation) throws IOException {
+        Map<String, String> f = generation.fields;
+        Set<String> expectedKeys = new HashSet<>(java.util.Arrays.asList("format", "slot", "sequence", "epoch",
+                "chains", "segment_controller_sample", "prior_sample_offset", "absolute_checkpoint_sample",
+                "totalSwaps", "successfullSwaps", "successfullSwaps0", "deltaTemperature", "acceptedSwaps", "spacing"));
+        Map<String, String> signature = restartConfiguration();
+        expectedKeys.addAll(signature.keySet());
+        for (Map.Entry<String, String> entry : signature.entrySet())
+            if (!require(f, entry.getKey()).equals(entry.getValue())) throw new IOException("Restart configuration mismatch: " + entry.getKey());
+        if (!require(f, "epoch").equals(CHECKPOINT_EPOCH) || number(f, "chains") != chains.length
+                || !require(f, "spacing").equals(spacing.name())) throw new IOException("Checkpoint epoch/chains/spacing mismatch");
+        long absolute = number(f, "absolute_checkpoint_sample");
+        try {
+            if (Math.addExact(number(f, "prior_sample_offset"), number(f, "segment_controller_sample")) != absolute)
+                throw new IOException("Checkpoint coordinate invariant failed");
+        } catch (ArithmeticException e) { throw new IOException("Checkpoint coordinate overflow", e); }
+        long total = number(f, "totalSwaps"), success = number(f, "successfullSwaps"), cold = number(f, "successfullSwaps0");
+        if (total > Integer.MAX_VALUE || cold > success || success > total || history(require(f,"acceptedSwaps")).size() > total)
+            throw new IOException("Invalid checkpoint counters/history");
+        final double savedDelta;
+        try { savedDelta = Double.parseDouble(require(f, "deltaTemperature")); }
+        catch (NumberFormatException e) { throw new IOException("Invalid saved deltaTemperature", e); }
+        if (!Double.isFinite(savedDelta) || savedDelta < 0 || savedDelta != applySpacingBounds(savedDelta))
+            throw new IOException("Saved deltaTemperature outside qualified bounds");
+        generation.rankFiles = new Path[chains.length];
+        Set<String> fileNames = new HashSet<>();
+        for (int rank = 0; rank < chains.length; rank++) {
+            String prefix = "rank." + rank + ".";
+            for (String suffix : new String[]{"rank","file","sha256","beta","physical_at_commit"}) expectedKeys.add(prefix + suffix);
+            if (number(f, prefix + "rank") != rank) throw new IOException("Duplicate/missing checkpoint rank");
+            if (number(f, prefix + "physical_at_commit") >= chains.length) throw new IOException("Invalid diagnostic physical index");
+            String name = require(f, prefix + "file");
+            Path relative = Path.of(name);
+            if (relative.isAbsolute() || relative.getNameCount() != 1 || name.equals(".") || name.equals("..")
+                    || name.contains("\n") || name.contains("\r") || !fileNames.add(name))
+                throw new IOException("Invalid/duplicate committed rank filename");
+            Path path = descriptorPath(generation.slot).getParent().resolve(relative);
+            validateRankFile(path, absolute);
+            if (!sha256(path).equals(require(f, prefix + "sha256"))) throw new IOException("Committed rank SHA-256 mismatch: " + rank);
+            double temperature = spacing == Spacing.Geometric ? rank * savedDelta
+                    : savedDelta == 0 ? 0 : Math.expm1(-savedDelta * Math.log1p(-rank / (double) chains.length));
+            try {
+                double beta = Double.parseDouble(require(f, prefix + "beta"));
+                if (!betaAgrees(beta, 1.0 / (1.0 + temperature)) || (rank == 0 && beta != 1.0))
+                    throw new IOException("Saved beta/delta disagreement at rank " + rank);
+            } catch (NumberFormatException e) { throw new IOException("Invalid saved beta", e); }
+            generation.rankFiles[rank] = path;
+        }
+        if (!f.keySet().equals(expectedKeys)) throw new IOException("Unexpected/missing checkpoint fields or ranks");
+    }
+
+    private void preflightRestart() throws IOException {
+        if (!restoreFromFile) {
+            if (Files.exists(descriptorPath("A")) || Files.exists(descriptorPath("B")))
+                throw new IOException("Fresh run would overwrite existing committed generations; use a new state path or resume");
+            return;
+        }
+        Generation generation = discoverGeneration();
+        Map<String, String> f = generation.fields;
+        deltaTemperature = Double.parseDouble(require(f, "deltaTemperature"));
+        totalSwaps = (int) number(f, "totalSwaps");
+        successfullSwaps = (int) number(f, "successfullSwaps");
+        successfullSwaps0 = (int) number(f, "successfullSwaps0");
+        acceptedSwaps = history(require(f, "acceptedSwaps"));
+        sampleOffset = number(f, "absolute_checkpoint_sample");
+        segmentControllerSample = 0;
+        committedSlot = generation.slot;
+        committedSequence = generation.sequence;
+        restoreGeneration = generation;
+    }
+
+    /** Test-only override seam for deterministic failure injection; inert in the production class.
+     * No XML input, property or environment switch enables failures. */
+    void checkpointFailurePoint(String stage) throws IOException { }
+
+    void storeStateToFile(long currentSample) throws IOException {
+        verifyCheckpointStop(currentSample);
+        int[] byRank = verifyRankLadder();
+        long absolute = Math.addExact(sampleOffset, currentSample);
+        String slot = committedSlot == null || committedSlot.equals("B") ? "A" : "B";
+        long sequence = Math.addExact(committedSequence, 1);
+        Path descriptor = descriptorPath(slot);
+        Path stagedDescriptor = Path.of(descriptor + ".tmp");
+        Files.deleteIfExists(descriptor); // Invalidate only the inactive generation before any rank writes.
+        Files.deleteIfExists(stagedDescriptor);
+        checkpointFailurePoint("AFTER_INVALIDATION");
+        Map<String, String> fields = new TreeMap<>(restartConfiguration());
+        fields.put("format", "CoupledMCMC-checkpoint-v1");
+        fields.put("slot", slot);
+        fields.put("sequence", Long.toString(sequence));
+        fields.put("epoch", CHECKPOINT_EPOCH);
+        fields.put("chains", Integer.toString(chains.length));
+        fields.put("segment_controller_sample", Long.toString(currentSample));
+        fields.put("prior_sample_offset", Long.toString(sampleOffset));
+        fields.put("absolute_checkpoint_sample", Long.toString(absolute));
+        fields.put("totalSwaps", Integer.toString(totalSwaps));
+        fields.put("successfullSwaps", Integer.toString(successfullSwaps));
+        fields.put("successfullSwaps0", Integer.toString(successfullSwaps0));
+        fields.put("deltaTemperature", Double.toString(deltaTemperature));
+        fields.put("acceptedSwaps", acceptedSwaps.toString().replace("[", "").replace("]", "").replace(" ", ""));
+        fields.put("spacing", spacing.name());
+        for (int rank = 0; rank < chains.length; rank++) {
+            String prefix = "rank." + rank + ".";
+            String name = descriptor.getFileName() + ".rank-" + rank + ".state";
+            Path rankFile = descriptor.getParent().resolve(name);
+            chains[byRank[rank]].storeCommittedState(rankFile, absolute);
+            fields.put(prefix + "rank", Integer.toString(rank));
+            fields.put(prefix + "file", name);
+            fields.put(prefix + "beta", Double.toString(chains[byRank[rank]].getBeta()));
+            fields.put(prefix + "physical_at_commit", Integer.toString(byRank[rank]));
+            checkpointFailurePoint("AFTER_RANK_" + (rank + 1));
+        }
+        checkpointFailurePoint("AFTER_ALL_RANKS");
+        for (int rank = 0; rank < chains.length; rank++) {
+            String prefix = "rank." + rank + ".";
+            Path file = descriptor.getParent().resolve(fields.get(prefix + "file"));
+            validateRankFile(file, absolute);
+            fields.put(prefix + "sha256", sha256(file));
+        }
+        Generation candidate = new Generation(slot, sequence, fields);
+        validateGeneration(candidate);
+        verifyCheckpointStop(currentSample);
+        checkpointFailurePoint("AFTER_VALIDATION");
+        StringBuilder text = new StringBuilder();
+        for (Map.Entry<String, String> entry : fields.entrySet()) text.append(entry.getKey()).append('=').append(entry.getValue()).append('\n');
+        Files.writeString(stagedDescriptor, text, StandardCharsets.UTF_8);
+        if (!readDescriptor(stagedDescriptor).equals(fields)) throw new IOException("Staged descriptor verification failed");
+        checkpointFailurePoint("BEFORE_PUBLICATION");
+        // No fallback if atomic publication is unsupported. This is a process-failure contract, not a power-loss guarantee.
+        Files.move(stagedDescriptor, descriptor, StandardCopyOption.ATOMIC_MOVE);
+        committedSlot = slot;
+        committedSequence = sequence;
+        segmentControllerSample = currentSample;
+        System.out.println("MC3_COMMIT slot=" + slot + " sequence=" + sequence + " local=" + currentSample + " absolute=" + absolute);
+    }
+
 	double getDelta() {
 		double target = targetAcceptanceProbabilityInput.get();	
 
@@ -862,7 +1265,7 @@ public class CoupledMCMC extends MCMC {
 			if (acceptedSwaps.get(k))
 				p_local += 1;
 		
-		p_local /= acceptedSwaps.size();
+		p_local /= acceptedSwaps.size() - acceptedSwaps.size()/10;
 		
 		
 		
