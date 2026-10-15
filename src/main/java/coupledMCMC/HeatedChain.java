@@ -123,6 +123,21 @@ public class HeatedChain extends MCMC {
 	}
 
 	
+    /** Serialize a stopped chain using BEAST's composite State + OperatorSchedule format.
+     * The controller validates the result because State.storeToFile can swallow IO failures. */
+    void storeCommittedState(java.nio.file.Path file, long absoluteSample) throws IOException {
+        String workingFile = stateFileName;
+        try {
+            java.nio.file.Files.deleteIfExists(file);
+            java.nio.file.Files.deleteIfExists(java.nio.file.Path.of(file.toString() + ".new"));
+            setStateFileName(file.toString());
+            state.storeToFile(absoluteSample);
+            operatorSchedule.storeToFile();
+        } finally {
+            setStateFileName(workingFile);
+        }
+    }
+
 	protected double calcCurrentLogLikelihoodRobustly() {
 		oldLogLikelihood = robustlyCalcPosterior(posterior);
 		return getCurrentLogLikelihood();
@@ -221,6 +236,9 @@ public class HeatedChain extends MCMC {
 		
 
 		for (long sampleNr = currentSample; sampleNr <= runUntil; sampleNr++) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("Heated chain worker cancellation requested");
+            }
             final long currentState = sampleNr;
             final Operator operator = propagateState(sampleNr);
 //            System.out.println(chainNr + " " + sampleNr);
